@@ -1,0 +1,1 @@
+.model-row{display:grid;grid-template-columns:74px minmax(0,1fr);align-items:center;gap:10px;margin-top:13px}.model-row .field-label{margin:0}.model-row select{margin:0;min-width:0;padding:10px 30px 10px 12px;font-size:12px;background-position:calc(100% - 17px) 15px,calc(100% - 12px) 15px}.model-row select option{font-size:12px}

@@ -1,0 +1,28 @@
+{
+  "name": "opencode-story-room",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,web \"tsx watch server/index.ts\" \"vite --host 127.0.0.1\"",
+    "build": "tsc -p tsconfig.server.json && vite build",
+    "start": "node dist-server/index.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "jsonc-parser": "^3.3.1",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.30",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^4.7.0",
+    "concurrently": "^9.2.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vite": "^6.0.0"
+  }
+}
