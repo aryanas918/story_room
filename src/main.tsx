@@ -1,241 +1,161 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 import "./models.css";
 import "./visual-novel.css";
 import "./retry.css";
+import "./library.css";
 
-type Agent = { id: string; name: string; description: string; system: string };
+type Character = { id: string; name: string; description: string; system: string };
 type Scenario = { id: string; title: string; setup: string };
 type Turn = { type?: "agent" | "narrator"; agentId: string; agentName: string; text: string; createdAt: string };
-type Conversation = {
-  id: string; scenarioId: string; scenarioTitle: string; setup: string; agentIds: string[]; model?: string;
-  nextAgentIndex?: number; rounds?: number; completedRounds?: number;
-  status: "running" | "generating" | "waiting" | "completed" | "stopped" | "error" | "interrupted";
-  turns: Turn[]; createdAt: string; updatedAt: string; error?: string;
-};
-type Bootstrap = { agents: Agent[]; scenarios: Scenario[]; models: string[] };
-
+type Conversation = { id: string; scenarioId: string; scenarioTitle: string; setup: string; agentIds: string[]; characters?: Character[]; model?: string; provider?: "groq"; nextAgentId?: string; nextAgentIndex?: number; status: "running" | "generating" | "waiting" | "completed" | "stopped" | "error" | "interrupted"; turns: Turn[]; createdAt: string; updatedAt: string; error?: string; activeTurn?: string };
+type Bootstrap = { agents: Character[]; characters: Character[]; scenarios: Scenario[]; models: string[]; groqConfigured: boolean; error?: string };
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
-  const value = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(value.error ?? `Request failed (${response.status})`);
-  return value as T;
+  const response = await fetch(url, init); const value = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(value.error ?? `Request failed (${response.status})`); return value as T;
 }
+const blankCharacter = (): Character => ({ id: "", name: "", description: "", system: "" });
+const blankScenario = (): Scenario => ({ id: "", title: "", setup: "" });
+function makeId(value: string) { return value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); }
 
 function App() {
-  const [bootstrap, setBootstrap] = useState<Bootstrap>({ agents: [], scenarios: [], models: [] });
-  const [history, setHistory] = useState<Conversation[]>([]);
-  const [selected, setSelected] = useState<Conversation | null>(null);
-  const [scenarioId, setScenarioId] = useState("");
-  const [model, setModel] = useState("");
-  const [agentIds, setAgentIds] = useState<string[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [advancing, setAdvancing] = useState(false);
-  const [storyBeat, setStoryBeat] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [refreshToken, setRefreshToken] = useState(0);
+  const [bootstrap, setBootstrap] = useState<Bootstrap>({ agents: [], characters: [], scenarios: [], models: [], groqConfigured: false });
+  const [history, setHistory] = useState<Conversation[]>([]); const [selected, setSelected] = useState<Conversation | null>(null);
+  const [scenarioId, setScenarioId] = useState(""); const [model, setModel] = useState(""); const [agentIds, setAgentIds] = useState<string[]>([]);
+  const [nextAgentId, setNextAgentId] = useState(""); const [storyBeat, setStoryBeat] = useState(""); const [newCharacterId, setNewCharacterId] = useState("");
+  const [busy, setBusy] = useState(false); const [advancing, setAdvancing] = useState(false); const [error, setError] = useState(""); const [loading, setLoading] = useState(true);
+  const [manager, setManager] = useState<"characters" | "scenarios" | null>(null); const [editingCharacter, setEditingCharacter] = useState<Character>(blankCharacter()); const [editingScenario, setEditingScenario] = useState<Scenario>(blankScenario()); const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    Promise.all([api<Bootstrap>("/api/bootstrap"), api<Conversation[]>("/api/conversations")])
-      .then(([config, conversations]) => {
-        setBootstrap(config); setHistory(conversations);
-        setScenarioId(config.scenarios[0]?.id ?? "");
-        setModel((current) => current && config.models.includes(current) ? current : config.models.find((item) => item === "opencode/beam-free") ?? config.models[0] ?? "");
-        setAgentIds(config.agents.map((agent) => agent.id));
-        const resumable = conversations.find((conversation) => ["waiting", "generating", "error", "interrupted"].includes(conversation.status) && conversation.nextAgentIndex !== undefined);
-        if (resumable) {
-          setSelected(resumable);
-          if (resumable.model && config.models.includes(resumable.model)) setModel(resumable.model);
-        }
-      })
-      .catch((reason: Error) => setError(reason.message))
-      .finally(() => setLoading(false));
-  }, [refreshToken]);
+  async function reload() {
+    const [config, conversations] = await Promise.all([api<Bootstrap>("/api/bootstrap"), api<Conversation[]>("/api/conversations")]);
+    setBootstrap(config); setHistory(conversations); setScenarioId((current) => config.scenarios.some((s) => s.id === current) ? current : config.scenarios[0]?.id ?? "");
+    setModel((current) => current && config.models.includes(current) ? current : config.models[0] ?? "");
+    setAgentIds((current) => current.length ? current.filter((id) => config.characters.some((c) => c.id === id)) : config.characters.map((c) => c.id));
+    return { config, conversations };
+  }
+  useEffect(() => { reload().then(({ config, conversations }) => {
+    const resumable = conversations.find((item) => item.provider === "groq" && ["waiting", "generating", "error", "interrupted"].includes(item.status));
+    if (resumable) { setSelected(resumable); if (resumable.model && config.models.includes(resumable.model)) setModel(resumable.model); }
+    if (config.error) setError(config.error);
+  }).catch((reason: Error) => setError(reason.message)).finally(() => setLoading(false)); }, []);
 
   useEffect(() => {
     if (!selected || !["generating", "running"].includes(selected.status)) { setBusy(false); return; }
-    setBusy(true);
-    const stream = new EventSource(`/api/conversations/${selected.id}/events`);
-    stream.addEventListener("snapshot", (event) => {
-      const snapshot = JSON.parse((event as MessageEvent).data) as Conversation;
-      setSelected(snapshot); setBusy(["generating", "running"].includes(snapshot.status));
-    });
-    stream.addEventListener("turn", (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as { turn: Turn; nextAgentIndex: number };
-      setSelected((current) => current ? { ...current, turns: current.turns.some((turn) => turn.createdAt === payload.turn.createdAt) ? current.turns : [...current.turns, payload.turn], nextAgentIndex: payload.nextAgentIndex } : current);
-    });
-    stream.addEventListener("turn-start", (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as { agentName: string; turnNumber: number };
-      setSelected((current) => current ? { ...current, activeTurn: `${payload.agentName} · Turn ${payload.turnNumber}` } as Conversation : current);
-    });
-    stream.addEventListener("waiting", (event) => {
-      const conversation = JSON.parse((event as MessageEvent).data) as Conversation;
-      setSelected(conversation); setBusy(false); stream.close();
-    });
-    stream.addEventListener("done", (event) => {
-      const result = JSON.parse((event as MessageEvent).data) as Conversation;
-      setSelected(result); setBusy(false); stream.close();
-    });
-    stream.addEventListener("failure", (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as { message: string };
-      setError(payload.message); setBusy(false); setSelected((current) => current ? { ...current, status: "error", error: payload.message } : current); stream.close();
-    });
-    stream.onerror = () => { stream.close(); setBusy(false); setRefreshToken((value) => value + 1); };
+    setBusy(true); const stream = new EventSource(`/api/conversations/${selected.id}/events`);
+    stream.addEventListener("snapshot", (event) => { const snapshot = JSON.parse((event as MessageEvent).data) as Conversation; setSelected(snapshot); setBusy(["generating", "running"].includes(snapshot.status)); });
+    stream.addEventListener("turn", (event) => { const payload = JSON.parse((event as MessageEvent).data) as { turn: Turn }; setSelected((current) => current ? { ...current, turns: current.turns.some((turn) => turn.createdAt === payload.turn.createdAt) ? current.turns : [...current.turns, payload.turn] } : current); });
+    stream.addEventListener("turn-start", (event) => { const value = JSON.parse((event as MessageEvent).data) as { agentName: string; turnNumber: number }; setSelected((current) => current ? { ...current, activeTurn: `${value.agentName} · Turn ${value.turnNumber}` } : current); });
+    stream.addEventListener("waiting", (event) => { const conversation = JSON.parse((event as MessageEvent).data) as Conversation; setSelected(conversation); setBusy(false); setNextAgentId(conversation.agentIds[0] ?? ""); stream.close(); void api<Conversation[]>("/api/conversations").then(setHistory); });
+    stream.addEventListener("done", (event) => { const result = JSON.parse((event as MessageEvent).data) as Conversation; setSelected(result); setBusy(false); stream.close(); void api<Conversation[]>("/api/conversations").then(setHistory); });
+    stream.addEventListener("failure", (event) => { const payload = JSON.parse((event as MessageEvent).data) as { message: string }; setError(payload.message); setBusy(false); setSelected((current) => current ? { ...current, status: "error", error: payload.message } : current); stream.close(); });
+    stream.onerror = () => { stream.close(); setBusy(false); void api<Conversation>(`/api/conversations/${selected.id}`).then(setSelected).catch(() => undefined); };
     return () => stream.close();
   }, [selected?.id, selected?.status]);
 
   async function startConversation() {
     setError(""); setBusy(true);
     try {
-      const conversation = await api<Conversation>("/api/conversations", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ scenarioId, model, agentIds: bootstrap.agents.map((agent) => agent.id).filter((id) => agentIds.includes(id)) }),
-      });
-      setSelected(conversation);
-      setHistory((items) => [conversation, ...items]);
+      const conversation = await api<Conversation>("/api/conversations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scenarioId, model, agentIds }) });
+      setSelected(conversation); setHistory((items) => [conversation, ...items]);
     } catch (reason) { setBusy(false); setError(reason instanceof Error ? reason.message : String(reason)); }
   }
-
-  async function stopConversation() {
-    if (!selected) return;
-    try {
-      const result = await api<{ stopped: boolean; status: string }>(`/api/conversations/${selected.id}/stop`, { method: "POST" });
-      if (result.status === "stopped") setSelected((current) => current ? { ...current, status: "stopped" } : current);
-    }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-  }
-
   async function advanceConversation() {
-    if (!selected || !isWaiting || advancing) return;
-    setAdvancing(true);
-    setError("");
-    try {
-      const conversation = await api<Conversation>(`/api/conversations/${selected.id}/next`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ storyBeat }),
-      });
-      setStoryBeat(""); setSelected(conversation);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    if (!selected || selected.status !== "waiting" || advancing || !nextAgentId) return;
+    setAdvancing(true); setError("");
+    try { const conversation = await api<Conversation>(`/api/conversations/${selected.id}/next`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ storyBeat, nextAgentId }) }); setStoryBeat(""); setSelected(conversation); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setAdvancing(false); }
   }
-
   async function retryTurn() {
-    if (!selected) return;
-    setError("");
-    try {
-      const conversation = await api<Conversation>(`/api/conversations/${selected.id}/retry`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model }),
-      });
-      setSelected(conversation);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    if (!selected) return; setError("");
+    try { setSelected(await api<Conversation>(`/api/conversations/${selected.id}/retry`, { method: "POST" })); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
   }
-
+  async function stopConversation() {
+    if (!selected) return;
+    try { const result = await api<{ status: string }>(`/api/conversations/${selected.id}/stop`, { method: "POST" }); if (result.status === "stopped") setSelected((value) => value ? { ...value, status: "stopped" } : value); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+  }
   async function openConversation(id: string) {
-    try {
-      const conversation = await api<Conversation>(`/api/conversations/${id}`);
-      setSelected(conversation); setStoryBeat(""); setError("");
-      if (conversation.model && bootstrap.models.includes(conversation.model)) setModel(conversation.model);
-    }
+    try { const conversation = await api<Conversation>(`/api/conversations/${id}`); setSelected(conversation); setStoryBeat(""); setError(""); setNextAgentId(conversation.agentIds[0] ?? ""); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+  }
+  async function addCharacterToScene() {
+    if (!selected || !newCharacterId) return;
+    try { const conversation = await api<Conversation>(`/api/conversations/${selected.id}/characters`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ characterId: newCharacterId }) }); setSelected(conversation); setNewCharacterId(""); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+  }
+  async function saveCharacter(event: React.FormEvent) {
+    event.preventDefault(); setSaving(true); setError("");
+    const value = { ...editingCharacter, id: editingCharacter.id || makeId(editingCharacter.name) };
+    try { await api(`/api/characters${bootstrap.characters.some((item) => item.id === value.id) ? `/${value.id}` : ""}`, { method: bootstrap.characters.some((item) => item.id === value.id) ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) }); await reload(); setEditingCharacter(blankCharacter()); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setSaving(false); }
+  }
+  async function deleteCharacter(character: Character) {
+    if (!window.confirm(`Delete ${character.name} from your character library?`)) return;
+    try { await api(`/api/characters/${character.id}`, { method: "DELETE" }); await reload(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+  }
+  async function saveScenario(event: React.FormEvent) {
+    event.preventDefault(); setSaving(true); setError(""); const value = { ...editingScenario, id: editingScenario.id || makeId(editingScenario.title) };
+    try { await api(`/api/scenarios${bootstrap.scenarios.some((item) => item.id === value.id) ? `/${value.id}` : ""}`, { method: bootstrap.scenarios.some((item) => item.id === value.id) ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) }); await reload(); setEditingScenario(blankScenario()); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setSaving(false); }
+  }
+  async function deleteScenario(scenario: Scenario) {
+    if (!window.confirm(`Delete scenario “${scenario.title}”?`)) return;
+    try { await api(`/api/scenarios/${scenario.id}`, { method: "DELETE" }); await reload(); }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
   }
 
-  const isRunning = busy && ["generating", "running"].includes(selected?.status ?? "");
-  const isWaiting = selected?.status === "waiting";
-  const activeTurn = (selected as (Conversation & { activeTurn?: string }) | null)?.activeTurn;
-  const nextAgentId = selected?.agentIds[(selected.nextAgentIndex ?? 0) % Math.max(selected.agentIds.length, 1)];
-  const nextAgentName = bootstrap.agents.find((agent) => agent.id === nextAgentId)?.name ?? nextAgentId ?? "Next character";
+  const cast = useMemo(() => selected ? (selected.characters ?? selected.agentIds.map((id) => bootstrap.characters.find((item) => item.id === id)).filter((item): item is Character => Boolean(item))) : [], [selected, bootstrap.characters]);
+  const isLegacy = Boolean(selected && selected.provider !== "groq");
+  const isRunning = !isLegacy && busy && ["generating", "running"].includes(selected?.status ?? ""); const isWaiting = !isLegacy && selected?.status === "waiting";
+  const availableForScene = bootstrap.characters.filter((character) => !selected?.agentIds.includes(character.id));
   const spokenTurns = selected?.turns.filter((turn) => turn.type !== "narrator").length ?? 0;
-
   return <main className="app-shell">
-    <header className="topbar">
-      <a className="brand" href="#" onClick={(event) => { event.preventDefault(); setSelected(null); }}>
-        <span className="brand-mark">◈</span><span>STORY ROOM</span>
-      </a>
-      <span className="local-pill"><i /> LOCAL WORKSPACE</span>
-    </header>
-
+    <header className="topbar"><a className="brand" href="#" onClick={(event) => { event.preventDefault(); setSelected(null); }}><span className="brand-mark">◈</span><span>STORY ROOM</span></a><span className="local-pill"><i /> LOCAL WORKSPACE · GROQ</span></header>
     <div className="layout">
       <aside className="sidebar">
-        <div className="sidebar-heading"><span>YOUR CHARACTERS</span><button className="icon-button" title="Reload config and scenarios" onClick={() => setRefreshToken((value) => value + 1)}>↻</button></div>
-        <div className="character-list">
-          {bootstrap.agents.map((agent, index) => <label className={`character ${agentIds.includes(agent.id) ? "selected" : ""}`} key={agent.id}>
-            <input type="checkbox" checked={agentIds.includes(agent.id)} disabled={isRunning} onChange={() => setAgentIds((ids) => ids.includes(agent.id) ? ids.filter((id) => id !== agent.id) : [...ids, agent.id])} />
-            <span className={`avatar avatar-${index % 4}`}>{agent.name[0]}</span>
-            <span className="character-copy"><b>{agent.name}</b><small>{agent.description || "OpenCode agent"}</small></span>
-            <span className="checkmark">✓</span>
-          </label>)}
-          {!loading && bootstrap.agents.length === 0 && <p className="empty-note">No agents found in opencode.jsonc.</p>}
-        </div>
-
+        <div className="sidebar-heading"><span>YOUR CHARACTERS</span><button className="icon-button" title="Manage characters" onClick={() => { setManager(manager === "characters" ? null : "characters"); setEditingCharacter(blankCharacter()); }}>＋</button></div>
+        <div className="character-list">{bootstrap.characters.map((character, index) => <label className={`character ${agentIds.includes(character.id) ? "selected" : ""}`} key={character.id}>
+          <input type="checkbox" checked={agentIds.includes(character.id)} disabled={isRunning || Boolean(selected)} onChange={() => setAgentIds((ids) => ids.includes(character.id) ? ids.filter((id) => id !== character.id) : [...ids, character.id])} />
+          <span className={`avatar avatar-${index % 4}`}>{character.name[0]}</span><span className="character-copy"><b>{character.name}</b><small>{character.description || "Custom character"}</small></span><span className="checkmark">✓</span>
+        </label>)}{!loading && bootstrap.characters.length === 0 && <p className="empty-note">Add a character to begin.</p>}</div>
         <div className="sidebar-heading history-heading"><span>RECENT SCENES</span><span className="count">{history.length}</span></div>
-        <div className="history-list">
-          {history.map((item) => <button className={`history-item ${selected?.id === item.id ? "active" : ""}`} key={item.id} onClick={() => openConversation(item.id)}>
-            <span className="history-icon">◷</span><span className="history-copy"><b>{item.scenarioTitle}</b><small>{new Date(item.createdAt).toLocaleString()}</small></span>
-            <span className={`status-dot ${item.status}`} />
-          </button>)}
-          {!loading && history.length === 0 && <p className="empty-note history-empty">Your conversations will show up here.</p>}
-        </div>
-
-        <div className="sidebar-foot"><span className="foot-glyph">⌘</span><span>Powered by OpenCode</span></div>
+        <div className="history-list">{history.map((item) => <button className={`history-item ${selected?.id === item.id ? "active" : ""}`} key={item.id} onClick={() => openConversation(item.id)}><span className="history-icon">◷</span><span className="history-copy"><b>{item.scenarioTitle}</b><small>{new Date(item.createdAt).toLocaleString()}</small></span><span className={`status-dot ${item.status}`} /></button>)}{!loading && history.length === 0 && <p className="empty-note history-empty">Your conversations will show up here.</p>}</div>
+        <div className="sidebar-foot"><span className="foot-glyph">✦</span><span>Groq key stays on this machine</span></div>
       </aside>
-
       <section className="main-panel">
-        {loading ? <div className="welcome loading"><span className="spinner" />Loading your agents…</div> : !selected ? <div className="welcome">
-          <div className="welcome-eyebrow"><span className="sparkle">✳</span> A LITTLE CROSSWORLD CONVERSATION</div>
-          <h1>Put them in a room.<br /><em>See what happens.</em></h1>
-          <p className="intro">Gather your OpenCode agents into one shared story. They’ll take turns, react to each other, and figure things out together.</p>
-          <section className="setup-card">
-            <div className="field-label">CHOOSE A SCENARIO <button className="refresh-text" onClick={() => setRefreshToken((value) => value + 1)}>↻ Reload file</button></div>
-            <select value={scenarioId} onChange={(event) => setScenarioId(event.target.value)} disabled={isRunning}>
-              {bootstrap.scenarios.map((scenario) => <option value={scenario.id} key={scenario.id}>{scenario.title}</option>)}
-            </select>
-            <div className="model-row"><label className="field-label" htmlFor="model-select">MODEL</label><select id="model-select" value={model} onChange={(event) => setModel(event.target.value)} disabled={isRunning}>
-              {bootstrap.models.map((item) => <option value={item} key={item}>{item}</option>)}
-            </select></div>
-            <p className="scenario-preview">{bootstrap.scenarios.find((scenario) => scenario.id === scenarioId)?.setup}</p>
-            <div className="setup-bottom">
-              <span className="turn-mode-note">Take the story one character at a time</span>
-              <button className="start-button" disabled={!scenarioId || !model || !agentIds.length || isRunning} onClick={startConversation}>Start the scene <span>↗</span></button>
-            </div>
-            <div className="secure-note"><span>⌑</span> Runs locally with your configured OpenCode agents</div>
+        {manager && <section className="library-manager"><div className="manager-heading"><b>{manager === "characters" ? "Character library" : "Scenario library"}</b><button className="icon-button" onClick={() => setManager(null)}>×</button></div>
+          {manager === "characters" ? <><div className="library-items">{bootstrap.characters.map((character) => <div className="library-item" key={character.id}><span><b>{character.name}</b><small>{character.description || character.id}</small></span><button onClick={() => setEditingCharacter(character)}>Edit</button><button className="danger-link" onClick={() => void deleteCharacter(character)}>Delete</button></div>)}</div>
+            <form className="library-form" onSubmit={saveCharacter}><b>{editingCharacter.id ? "Edit character" : "Create character"}</b><input required placeholder="Character name" value={editingCharacter.name} onChange={(e) => setEditingCharacter({ ...editingCharacter, name: e.target.value })} /><input placeholder="Short description" value={editingCharacter.description} onChange={(e) => setEditingCharacter({ ...editingCharacter, description: e.target.value })} /><textarea required placeholder="Personality and roleplay instructions" value={editingCharacter.system} onChange={(e) => setEditingCharacter({ ...editingCharacter, system: e.target.value })} /><div className="manager-actions"><button type="button" onClick={() => setEditingCharacter(blankCharacter())}>Clear</button><button className="start-button" disabled={saving}>{saving ? "Saving…" : "Save character"}</button></div></form></> : <><div className="library-items">{bootstrap.scenarios.map((scenario) => <div className="library-item" key={scenario.id}><span><b>{scenario.title}</b><small>{scenario.id}</small></span><button onClick={() => setEditingScenario(scenario)}>Edit</button><button className="danger-link" onClick={() => void deleteScenario(scenario)}>Delete</button></div>)}</div>
+            <form className="library-form" onSubmit={saveScenario}><b>{editingScenario.id ? "Edit scenario" : "Create scenario"}</b><input required placeholder="Scenario title" value={editingScenario.title} onChange={(e) => setEditingScenario({ ...editingScenario, title: e.target.value })} /><textarea required placeholder="Scene setup and premise" value={editingScenario.setup} onChange={(e) => setEditingScenario({ ...editingScenario, setup: e.target.value })} /><div className="manager-actions"><button type="button" onClick={() => setEditingScenario(blankScenario())}>Clear</button><button className="start-button" disabled={saving}>{saving ? "Saving…" : "Save scenario"}</button></div></form></>}
+        </section>}
+        {!selected ? <div className="welcome"><div className="welcome-eyebrow"><span className="sparkle">✳</span> A SHARED STORY, ONE TURN AT A TIME</div><h1>Gather your <em>characters.</em></h1><p className="intro">Build a cast, set the scene, and guide the story as it unfolds. Choose who speaks next after every turn.</p>
+          <section className="setup-card"><label className="field-label" htmlFor="scenario-select">CHOOSE A SCENARIO <button className="refresh-text" onClick={() => { setManager("scenarios"); setEditingScenario(blankScenario()); }}>Manage scenarios</button></label><select id="scenario-select" value={scenarioId} onChange={(e) => setScenarioId(e.target.value)}><option value="">Select a scenario</option>{bootstrap.scenarios.map((scenario) => <option value={scenario.id} key={scenario.id}>{scenario.title}</option>)}</select>
+            <div className="model-row"><label className="field-label" htmlFor="model-select">GROQ MODEL</label><select id="model-select" value={model} onChange={(e) => setModel(e.target.value)}><option value="">Select a model</option>{bootstrap.models.map((item) => <option value={item} key={item}>{item}</option>)}</select></div>
+            <p className="scenario-preview">{bootstrap.scenarios.find((scenario) => scenario.id === scenarioId)?.setup}</p><div className="setup-bottom"><span className="turn-mode-note">{agentIds.length} characters selected</span><button className="start-button" disabled={!scenarioId || !model || !agentIds.length || isRunning} onClick={() => void startConversation()}>Start the scene <span>↗</span></button></div>
+            <div className="secure-note"><span>⌑</span> Uses GROQ_API_KEY from the local server environment</div>
           </section>
-          {error && <div className="error-banner">{error}</div>}
-        </div> : <div className="conversation-view">
-          <div className="scene-header">
-            <div><div className="welcome-eyebrow"><span className="sparkle">✳</span> {isWaiting ? "YOUR MOVE" : isRunning ? "SCENE IN PROGRESS" : selected.status.toUpperCase()}</div><h1>{selected.scenarioTitle}</h1></div>
-            <div className="scene-actions">{isRunning ? <button className="stop-button" onClick={stopConversation}><span>■</span> End after this turn</button> : <button className="new-scene" onClick={() => { setSelected(null); setError(""); setStoryBeat(""); }}>+ New scene</button>}</div>
-          </div>
-          <div className="scene-setup"><span className="setup-icon">✦</span><p>{selected.setup}</p></div>
-          <div className="conversation-meta"><span>{selected.agentIds.map((id) => bootstrap.agents.find((agent) => agent.id === id)?.name ?? id).join("  ·  ")} <span className="meta-divider">/</span> {selected.model ?? "Saved scene"}</span><span>TURN {spokenTurns}</span></div>
-          <div className="turn-list">
-            {selected.turns.map((turn, index) => <article className={`turn-card ${turn.type === "narrator" ? "narrator-card" : ""}`} key={`${turn.createdAt}-${index}`}>
-              <div className={`turn-avatar ${turn.type === "narrator" ? "narrator-avatar" : `avatar-${index % 4}`}`}>{turn.type === "narrator" ? "✦" : turn.agentName[0]}</div>
-              <div className="turn-body"><div className="turn-byline"><b>{turn.agentName}</b><time>{new Date(turn.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</time></div><p>{turn.text}</p></div>
-            </article>)}
-            {isRunning && <div className="thinking-row"><span className="thinking-dots"><i /><i /><i /></span><span>{activeTurn ? `${activeTurn} is speaking…` : "The characters are gathering…"}</span></div>}
-            {!isRunning && selected.turns.length === 0 && <div className="empty-conversation">No turns were recorded for this scene.</div>}
-          </div>
-          {isWaiting && <section className="director-panel">
-            <label htmlFor="story-beat">ADD TO THE STORY <span>OPTIONAL</span></label>
-            <textarea id="story-beat" value={storyBeat} maxLength={2000} onChange={(event) => setStoryBeat(event.target.value)} placeholder="A new foe appears from the shadows. He is huge..." />
-            <div className="director-actions"><button className="stop-button" onClick={stopConversation}>End scene</button><button className="next-button" disabled={advancing} onClick={advanceConversation}>{advancing ? "Starting..." : `Next: ${nextAgentName}`} <span>→</span></button></div>
+          {bootstrap.error && <div className="error-banner">{bootstrap.error}</div>}{error && <div className="error-banner">{error}</div>}
+        </div> : <div className="conversation-view"><div className="scene-header"><div><div className="welcome-eyebrow"><span className="sparkle">✳</span> {isWaiting ? "YOUR MOVE" : isRunning ? "SCENE IN PROGRESS" : selected.status.toUpperCase()}</div><h1>{selected.scenarioTitle}</h1></div><div className="scene-actions">{isRunning ? <button className="stop-button" onClick={() => void stopConversation()}>■ End after this turn</button> : <button className="new-scene" onClick={() => { setSelected(null); setError(""); setStoryBeat(""); }}>+ New scene</button>}</div></div>
+          <div className="scene-setup"><span className="setup-icon">✦</span><p>{selected.setup}</p></div><div className="conversation-meta"><span>{cast.map((character) => character.name).join(" · ")} <span className="meta-divider">/</span> {selected.model ?? "Legacy conversation"}</span><span>TURN {spokenTurns}</span></div>
+          <div className="turn-list">{selected.turns.map((turn, index) => <article className={`turn-card ${turn.type === "narrator" ? "narrator-card" : ""}`} key={`${turn.createdAt}-${index}`}><div className={`turn-avatar ${turn.type === "narrator" ? "narrator-avatar" : `avatar-${index % 4}`}`}>{turn.type === "narrator" ? "✦" : turn.agentName[0]}</div><div className="turn-body"><div className="turn-byline"><b>{turn.agentName}</b><time>{new Date(turn.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</time></div><p>{turn.text}</p></div></article>)}{isRunning && <div className="thinking-row"><span className="thinking-dots"><i /><i /><i /></span><span>{selected.activeTurn ?? "The characters are gathering…"}</span></div>}{!isRunning && !selected.turns.length && <div className="empty-conversation">No turns were recorded for this scene.</div>}</div>
+          {isWaiting && <section className="director-panel"><label htmlFor="story-beat">ADD TO THE STORY <span>OPTIONAL</span></label><textarea id="story-beat" value={storyBeat} maxLength={2000} onChange={(e) => setStoryBeat(e.target.value)} placeholder="A new foe appears from the shadows…" />
+            <div className="speaker-choice"><label htmlFor="next-speaker">NEXT SPEAKER</label><select id="next-speaker" value={nextAgentId} onChange={(e) => setNextAgentId(e.target.value)}>{cast.map((character) => <option value={character.id} key={character.id}>{character.name}</option>)}</select><button onClick={() => void stopConversation()}>End scene</button><button className="next-button" disabled={advancing || !nextAgentId} onClick={() => void advanceConversation()}>{advancing ? "Starting…" : "Next speaker"} <span>→</span></button></div>
+            {availableForScene.length > 0 && <div className="add-cast"><label htmlFor="add-character">ADD A CHARACTER</label><select id="add-character" value={newCharacterId} onChange={(e) => setNewCharacterId(e.target.value)}><option value="">Choose character</option>{availableForScene.map((c) => <option value={c.id} key={c.id}>{c.name}</option>)}</select><button onClick={() => void addCharacterToScene()} disabled={!newCharacterId}>Add to scene</button></div>}
           </section>}
           {(error || selected.status === "error" || selected.status === "interrupted") && <div className="error-banner conversation-error">{error || selected.error || "This turn needs to be retried."}</div>}
-          {(selected.status === "error" || selected.status === "interrupted") && selected.nextAgentIndex !== undefined && <div className="retry-panel">
-            <label htmlFor="retry-model">RETRY MODEL</label>
-            <select id="retry-model" value={model} onChange={(event) => setModel(event.target.value)}>
-              {bootstrap.models.map((item) => <option value={item} key={item}>{item}</option>)}
-            </select>
-            <button className="retry-button" disabled={!model} onClick={retryTurn}>Retry {nextAgentName}</button>
-          </div>}
-          {!isRunning && !isWaiting && selected.status !== "error" && selected.status !== "interrupted" && <div className={`ending-note ${selected.status}`}><span>{selected.status === "completed" ? "✧" : selected.status === "stopped" ? "Ⅱ" : "!"}</span>{selected.status === "completed" ? "Scene complete" : selected.status === "stopped" ? "Scene ended" : `Scene ${selected.status}`}</div>}
+          {isLegacy && <div className="ending-note">Legacy OpenCode conversation · history only</div>}
+          {!isLegacy && (selected.status === "error" || selected.status === "interrupted") && <button className="retry-button" onClick={() => void retryTurn()}>Retry {cast.find((c) => c.id === (selected.nextAgentId ?? selected.agentIds[selected.nextAgentIndex ?? 0]))?.name ?? "next character"}</button>}
+          {!isLegacy && !isRunning && !isWaiting && selected.status !== "error" && selected.status !== "interrupted" && <div className={`ending-note ${selected.status}`}>{selected.status === "stopped" ? "Scene ended" : selected.status}</div>}
         </div>}
-        <footer className="main-footer"><span>Let the story unfold, one turn at a time.</span><span>SCENARIOS.JSON <span className="footer-sep">·</span> LOCAL TRANSCRIPTS</span></footer>
+        <footer className="main-footer"><span>Let the story unfold, one turn at a time.</span><span>GROQ API <span className="footer-sep">·</span> LOCAL TRANSCRIPTS</span></footer>
       </section>
     </div>
   </main>;
 }
-
 createRoot(document.getElementById("root")!).render(<React.StrictMode><App /></React.StrictMode>);
